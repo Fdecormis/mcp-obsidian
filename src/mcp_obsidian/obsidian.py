@@ -2,6 +2,8 @@ import re
 import requests
 import urllib.parse
 import os
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 class Obsidian():
@@ -344,43 +346,44 @@ class Obsidian():
     
     def get_recent_changes(self, limit: int = 10, days: int = 90) -> Any:
         """Get recently modified files in the vault.
-        
+
+        Reimplemented (2026-07) to avoid the Dataview-DQL search endpoint, which
+        the Local REST API plugin stopped accepting at v4.x ("Unknown or invalid
+        Content-Type", error 40012). Uses the always-available JsonLogic search
+        view to fetch every file's modification time in a single request, then
+        filters, sorts and limits client-side. No dependency on the Dataview plugin.
+
         Args:
             limit: Maximum number of files to return (default: 10)
             days: Only include files modified within this many days (default: 90)
-            
-        Returns:
-            List of recently modified files with metadata
-        """
-        # Build the DQL query
-        query_lines = [
-            "TABLE file.mtime",
-            f"WHERE file.mtime >= date(today) - dur({days} days)",
-            "SORT file.mtime DESC",
-            f"LIMIT {limit}"
-        ]
-        
-        # Join with proper DQL line breaks
-        dql_query = "\n".join(query_lines)
-        
-        # Make the request to search endpoint
-        url = f"{self.get_base_url()}/search/"
-        headers = self._get_headers() | {
-            'Content-Type': 'application/vnd.olrapi.dataview.dql+txt'
-        }
-        
-        def call_fn():
-            response = requests.post(
-                url,
-                headers=headers,
-                data=dql_query.encode('utf-8'),
-                verify=self.verify_ssl,
-                timeout=self.timeout
-            )
-            response.raise_for_status()
-            return response.json()
 
-        return self._safe_call(call_fn)
+        Returns:
+            List of dicts {"path", "mtime" (epoch ms), "modified" (ISO-8601 UTC)},
+            most-recently-modified first.
+        """
+        # JsonLogic query whose "result" is each file's mtime (epoch ms). Every
+        # note returns a non-falsy numeric mtime, so this lists the whole vault
+        # with modification times in one request via the working JsonLogic path.
+        results = self.search_json({"var": "stat.mtime"})
+
+        cutoff_ms = (time.time() - days * 86400) * 1000
+        rows = []
+        for r in results or []:
+            if not isinstance(r, dict):
+                continue
+            mtime = r.get("result")
+            if isinstance(mtime, bool) or not isinstance(mtime, (int, float)):
+                continue
+            if mtime < cutoff_ms:
+                continue
+            rows.append({
+                "path": r.get("filename"),
+                "mtime": int(mtime),
+                "modified": datetime.fromtimestamp(mtime / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            })
+
+        rows.sort(key=lambda x: x["mtime"], reverse=True)
+        return rows[:limit]
 
 
 _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
